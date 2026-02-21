@@ -1,11 +1,11 @@
 """
-/classify — object detection only endpoint.
-Ported from Flask app.py (Color detection removed).
+/classify — High-speed object classification with A-Z color names and hex codes.
 """
 from __future__ import annotations
 
 import logging
-from typing import List, Tuple, Dict, Any
+import re
+from typing import List, Dict, Any
 
 import torch
 from fastapi import APIRouter, Depends, HTTPException
@@ -18,152 +18,147 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-# ── Constants & Configuration ─────────────────────────────────────────────────
+# ── Constants ────────────────────────────────────────────────────────────────
 
 OBJECT_CLASSES = [
-    # --- ANIMALS (Mammals) ---
     "cow", "lion", "tiger", "zebra", "elephant", "giraffe", "monkey", "panda", "bear",
     "koala", "kangaroo", "llama", "camel", "deer", "fox",
     "dog", "cat", "rabbit", "mouse", "pig", "sheep", "goat", "horse", "donkey", "hedgehog",
-    "hippopotamus", "squirrel",
-
-    # --- ANIMALS (Birds/Reptiles/Insects) ---
-    "owl", "duck", "chicken", "penguin",
+    "hippopotamus", "squirrel", "frog",
+    "owl", "duck", "chicken", "penguin", "goose", "parrot", "bird",
     "snake", "turtle", "crocodile",
-    "fish", "shark", "whale", "dolphin", "robot",
-
-    # --- TRANSPORT & VEHICLES ---
+    "fish", "shark",   "dolphin", "robot",
     "car", "boat", "ship",
-
-    # --- TOYS & HOUSEHOLD ---
     "balloon", "piano", "guitar", "book",
     "phone", "computer", "camera",
-
-    # --- NATURE & FOOD ---
-    "tree", "flower", "star",
-    "house", "turkey",
+    "tree", "flower", "star", "house", "turkey",
 ]
 
-OBJECT_PROMPTS = [
-    "a cartoon {obj}",
-    "a cute cartoon {obj}",
-    "a {obj} icon"
-]
+# Comprehensive A-Z Color mapping to Hex Codes
+COLOR_MAP = {
+    "amber": "#FFBF00", "aqua": "#00FFFF", "aquamarine": "#7FFFD4", "azure": "#F0FFFF",
+    "beige": "#F5F5DC", "black": "#000000", "blue": "#0000FF", "bronze": "#CD7F32",
+    "brown": "#A52A2A", "burgundy": "#800020", "cherry": "#DE3163",  
+    "copper": "#B87333", "coral": "#FF7F50", "crimson": "#DC143C", "cyan": "#00FFFF",
+    "emerald": "#50C878", "gold": "#FFD700", "gray": "#808080", "green": "#008000",
+    "indigo": "#4B0082", "ivory": "#FFFFF0", "jade": "#00A86B", "khaki": "#C3B091",
+    "lavender": "#E6E6FA", "lemon": "#FFF700", "lilac": "#C8A2C8", "lime": "#00FF00",
+    "magenta": "#FF00FF", "maroon": "#800000", "mauve": "#E0B0FF", "mint": "#98FF98",
+    "navy": "#000080", "olive": "#808000", "orange": "#FFA500", "peach": "#FFDAB9",
+    "pear": "#D1E231", "pink": "#FFC0CB", "plum": "#8E4585", "purple": "#800080",
+    "red": "#FF0000", "rose": "#FF007F", "ruby": "#E0115F", "salmon": "#FA8072",
+    "scarlet": "#FF2400", "silver": "#C0C0C0", "sky": "#87CEEB", "tan": "#D2B48C",
+    "teal": "#008080", "turquoise": "#40E0D0", "violet": "#EE82EE", "white": "#FFFFFF",
+    "yellow": "#FFFF00"
+}
 
-
-# ── Global Cache for Object Embeddings ────────────────────────────────────────
-
-_obj_text_features: torch.Tensor | None = None
-
+COLOR_LIST = list(COLOR_MAP.keys())
 
 def get_descriptive_label(c: str) -> str:
-    if c == "donkey": return "donkey with long ears"
-    if c == "llama":  return "llama with long neck"
-    if c == "camel":  return "camel with humps"
-    if c == "horse":  return "horse pony"
+    """Provides semantic hints to CLIP for better recognition."""
+    if c == "parrot":   return "a parrot bird or colorful macaw with a curved beak and vibrant feathers"
+    if c == "owl":      return "an owl bird with big round eyes and feathers"
+    if c == "goose":    return "a goose or water bird with a long neck and beak"
+    if c == "camel":    return "a camel with a hump on its back"
+    if c == "sheep":    return "a woolly sheep or lamb with thick white fleece"
+    if c == "goat":     return "a goat with horns and a small beard"
+    if c == "rabbit":   return "a rabbit or bunny with long ears and fluffy fur"
+    if c == "phone":    return "a smartphone or mobile phone with a touchscreen and a camera lens"
+    if c == "mouse":    return "a mouse or rodent with large rounded ears, whiskers, and a thin tail"
+    if c == "cat":      return "a cat or kitten with pointy ears, whiskers, and a long tail"
+    if c == "elephant": return "a large elephant with a long trunk and big floppy ears"
+    if c == "frog":     return "a frog or toad with bulging eyes, a squat body, and damp skin"
     return c
 
+# ── Global Cache ─────────────────────────────────────────────────────────────
+_cached_obj_features: torch.Tensor | None = None
+_cached_color_features: torch.Tensor | None = None
 
-# ── API Endpoint ──────────────────────────────────────────────────────────────
 
 class ClassifyRequest(BaseModel):
-    image: str  # Base64 string
+    image: str|None = None
+    imageData: str|None = None
+    question: str|None = None
+    questionType: str|None = None
 
 @router.post("/classify")
 async def classify(payload: ClassifyRequest, solver: CLIPSolver = Depends(get_solver)):
     try:
-        # 1. Pre-compute text features if needed
-        global _obj_text_features
-        if _obj_text_features is None:
-            logger.info("Computing text features for classification...")
-            all_obj_features = []
-            for prompt_template in OBJECT_PROMPTS:
-                prompts = [prompt_template.format(obj=get_descriptive_label(c)) for c in OBJECT_CLASSES]
-                features = solver.embed_texts(prompts)  # (N_classes, D)
-                all_obj_features.append(features)
+        img_b64 = payload.imageData or payload.image
+        if not img_b64: raise HTTPException(status_code=400, detail="Missing image")
+
+        global _cached_obj_features, _cached_color_features
+        if _cached_obj_features is None:
+            obj_feats_list = []
+            for pt in ["a photo of {}", "a cartoon {} character"]:
+                prompts = [pt.format(get_descriptive_label(c)) for c in OBJECT_CLASSES]
+                obj_feats_list.append(solver.embed_texts(prompts))
+            _cached_obj_features = torch.stack(obj_feats_list).mean(dim=0).to(torch.float32)
+            _cached_obj_features /= _cached_obj_features.norm(dim=-1, keepdim=True)
             
-            # Average features from different templates
-            # stack -> (3, N, D) -> mean(0) -> (N, D)
-            stacked = torch.stack(all_obj_features)
-            mean_feats = stacked.mean(dim=0)
-            _obj_text_features = mean_feats / mean_feats.norm(dim=-1, keepdim=True)
-            logger.info("Classification text features ready.")
+            color_prompts = [f"a {c} colored object" for c in COLOR_LIST]
+            _cached_color_features = solver.embed_texts(color_prompts).to(torch.float32)
+            _cached_color_features /= _cached_color_features.norm(dim=-1, keepdim=True)
 
-        # 2. Process Image
-        try:
-            full_image = solver.decode_image_b64(payload.image)
-        except Exception:
-            raise HTTPException(status_code=400, detail="Invalid base64 image")
+        full_img = solver.decode_image_b64(img_b64)
+        w, h = full_img.size
+        cells = [full_img.crop((c*(w//3), r*(h//3), (c+1)*(w//3), (r+1)*(h//3))) for r in range(3) for c in range(3)]
 
-        w, h = full_image.size
-        cell_w, cell_h = w // 3, h // 3
-        padding = 8
+        img_feats = solver.embed_images(cells).to(torch.float32)
+        device = img_feats.device
         
-        cells_images = []
-        
-        # 3. Split 3x3 Grid
-        for idx in range(9):
-            r, c = divmod(idx, 3)
-            left  = c * cell_w + padding
-            top   = r * cell_h + padding
-            right = (c + 1) * cell_w - padding
-            bottom= (r + 1) * cell_h - padding
+        # 1. Base Object Detection
+        obj_text_feats = _cached_obj_features.to(device)
+        obj_probs = ((img_feats @ obj_text_feats.T) / 0.02).softmax(dim=-1)
+        top_obj_conf, top_obj_idx = torch.topk(obj_probs, k=3, dim=-1)
+
+        # 2. Advanced Color Detection
+        color_text_feats = _cached_color_features.to(device)
+        color_probs = ((img_feats @ color_text_feats.T) / 0.02).softmax(dim=-1)
+        top_color_conf, top_color_idx = torch.topk(color_probs, k=1, dim=-1)
+
+        # 3. Dynamic Question Matching
+        answer = []
+        if payload.question:
+            q = payload.question.lower().strip()
+            q_refined = q
+            if "parrot" in q: q_refined = q.replace("parrot", "colorful parrot or macaw with curved beak")
             
-            # Ensure valid crop box
-            if right > left and bottom > top:
-                cell = full_image.crop((left, top, right, bottom))
-            else:
-                # Fallback if padding is too aggressive for small images
-                cell = full_image.crop((c*cell_w, r*cell_h, (c+1)*cell_w, (r+1)*cell_h))
+            target_prompt = f"a photo of {q_refined}"
+            neg_prompt = "background scene without the target object"
             
-            cells_images.append(cell)
+            q_feats = solver.embed_texts([target_prompt, neg_prompt]).to(device)
+            q_probs = ((img_feats @ q_feats.T) / 0.02).softmax(dim=-1)
+            
+            bird_set = {"bird", "parrot", "duck", "owl", "penguin", "goose", "chicken"}
+            keywords = [kw for kw in re.findall(r'\w+', q) if kw not in COLOR_LIST and kw not in ['a', 'the', 'select', 'all', 'of', 'and']]
+            
+            for i in range(9):
+                # High threshold for precision (updated from 0.86 to 0.90)
+                is_q_match = q_probs[i, 0] > 0.90 
+                cell_objs = {OBJECT_CLASSES[top_obj_idx[i, 0].item()], OBJECT_CLASSES[top_obj_idx[i, 1].item()]}
+                is_obj_related = False
+                for kw in keywords:
+                    if any(kw in ro or ro in kw for ro in cell_objs):
+                        is_obj_related = True; break
+                    if kw in bird_set and any(b in cell_objs for b in bird_set):
+                        is_obj_related = True; break
 
-        # 4. CLIP Embedding for all 9 cells
-        img_feats = solver.embed_images(cells_images)  # (9, D)
-
-        # 5. Determine Top Objects
-        temperature = 0.01
-        
-        # Ensure descriptors are on same device as images
-        text_feats = _obj_text_features.to(img_feats.device)
-        
-        obj_logits = (img_feats @ text_feats.T) / temperature
-        obj_probs = obj_logits.softmax(dim=-1)
-        
-        # Top-3 per cell
-        top_conf, top_idx = torch.topk(obj_probs, k=3, dim=-1)
-        
-        top_conf = top_conf.cpu().tolist()
-        top_idx = top_idx.cpu().tolist()
+                if is_q_match and is_obj_related:
+                    answer.append(i)
 
         results = []
         for i in range(9):
-            r, c = divmod(i, 3)
-            
-            # Filter matches
-            cell_confs = top_conf[i]
-            cell_indices = top_idx[i]
-            
-            pass_indices = [cell_indices[0]]
-            # Add secondary matches if confident enough
-            for j in range(1, 3):
-                if cell_confs[j] >= 0.3 and cell_confs[j] >= (cell_confs[0] * 0.5):
-                    pass_indices.append(cell_indices[j])
-            
-            pass_names = [OBJECT_CLASSES[idx] for idx in pass_indices]
-            
-            obj_name_str = " ".join(pass_names)
-            
-            result_item = {
+            color_name = COLOR_LIST[top_color_idx[i, 0].item()]
+            results.append({
                 "grid_position": i,
-                "object_name":   obj_name_str,  # No color prefix anymore
-                "detected_objects": pass_names,
-                "confidence":    round(cell_confs[0], 3),
-                "bbox": [c * cell_w, r * cell_h, (c + 1) * cell_w, (r + 1) * cell_h]
-            }
-            results.append(result_item)
-            
-        return {"grid_size": "3x3", "detected_objects": results}
+                "object": OBJECT_CLASSES[top_obj_idx[i, 0].item()],
+                "confidence": round(top_obj_conf[i, 0].item(), 3),
+                "color": color_name,
+                "color_code": COLOR_MAP[color_name]
+            })
+
+        return {"answer": answer, "detected_objects": results, "question": payload.question}
 
     except Exception as e:
         logger.exception("Classification error")

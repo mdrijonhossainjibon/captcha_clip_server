@@ -60,7 +60,7 @@ def get_descriptive_label(c: str) -> str:
     if c == "owl":      return "an owl bird with big round eyes and feathers"
     if c == "goose":    return "a goose or water bird with a long neck and beak"
     if c == "camel":    return "a camel with a hump on its back"
-    if c == "sheep":    return "a woolly sheep or lamb with thick white fleece"
+    if c == "sheep":    return "a puffy woolly sheep or lamb with thick curly white fleece"
     if c == "goat":     return "a goat with horns and a small beard"
     if c == "rabbit":   return "a rabbit or bunny with long ears and fluffy fur"
     if c == "phone":    return "a smartphone or mobile phone with a touchscreen and a camera lens"

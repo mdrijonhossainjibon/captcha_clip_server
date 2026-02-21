@@ -349,11 +349,11 @@ class CLIPSolver:
         solution = sorted(list(set(candidates)))
 
         # Per-cell match confidence  {cell (1-based): match %}
-        cell_scores = {i + 1: round(p * 100, 1) for i, p in enumerate(pos_probs)}
+        cell_scores = {str(i + 1): round(p * 100, 1) for i, p in enumerate(pos_probs)}
 
         # Per-cell top-label details
         cell_contents = {
-            i + 1: f"{c['label']} ({c['confidence']}%)"
+            str(i + 1): f"{c['label']} ({c['confidence']}%)"
             for i, c in enumerate(cell_labels)
         }
         

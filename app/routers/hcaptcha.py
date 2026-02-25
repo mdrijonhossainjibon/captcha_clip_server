@@ -40,6 +40,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import time
@@ -425,6 +426,23 @@ async def solve_hcaptcha(
         logger.info("hCaptcha request — type: %r | question: %r | tiles: %d",
                     q_type, question, len(images))
 
+        # ── Caching ───────────────────────────────────────────────────────────
+        # Create a unique hash for this challenge (Question + Images)
+        # Note: We sort image data or join them to ensure consistency
+        payload_str = f"{question}:{'|'.join(images)}"
+        challenge_hash = hashlib.sha256(payload_str.encode()).hexdigest()
+
+        # Check for cached solution
+        cached_solution = db.solutions.find_one({"hash": challenge_hash})
+        if cached_solution:
+            logger.info("hCaptcha — Cache HIT for %s", challenge_hash[:10])
+            return {
+                "success": True,
+                "solution": cached_solution["solution"],
+                "ai_processed": False,
+                "from_cache": True
+            }
+
         # ── Solve by type ─────────────────────────────────────────────────────
         if q_type == "objectClassify":
             # 3×3 grid — boolean array of length 9
@@ -447,14 +465,29 @@ async def solve_hcaptcha(
             logger.warning("Unknown questionType %r — falling back to objectClassify", q_type)
             solution = _solve_objectClassify(solver, images, question)
 
-        # ── Billing ───────────────────────────────────────────────────────────
+        # ── Save to Cache & Billing ───────────────────────────────────────────
+        background_tasks.add_task(
+            db.solutions.insert_one, 
+            {
+                "hash": challenge_hash,
+                "solution": solution,
+                "question": question,
+                "createdAt": datetime.utcnow()
+            }
+        )
+        
         background_tasks.add_task(
             db.packages.update_one,
             {"_id": active_pkg["_id"]},
             {"$inc": {"creditsUsed": 1}}
         )
 
-        return {"success": True, "solution": solution}
+        return {
+            "success": True,
+            "solution": solution,
+            "ai_processed": True,
+            "from_cache": False
+        }
 
     except Exception as e:
         logger.exception("hCaptcha error [type=%s]", payload.questionType)

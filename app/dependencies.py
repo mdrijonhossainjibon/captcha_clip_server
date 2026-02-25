@@ -1,11 +1,10 @@
-from app.models.clip_solver import CLIPSolver
+from app.models.clip_solver import MobileCLIPSolver
 
-_solver: CLIPSolver | None = None
+_solver: MobileCLIPSolver | None = None
 
 
-def get_solver() -> CLIPSolver:
+def get_solver() -> MobileCLIPSolver:
     global _solver
     if _solver is None:
-        # This triggers model loading if not already done by startup event
-        _solver = CLIPSolver()
+        _solver = MobileCLIPSolver()
     return _solver

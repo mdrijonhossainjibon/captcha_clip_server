@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import HOST, PORT
 from app.routers.service import router as service_router
 from app.routers.classify import router as classify_router
+from app.routers.hcaptcha import router as hcaptcha_router
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -39,6 +40,7 @@ app.add_middleware(
 # ── Routes ────────────────────────────────────────────────────────────────────
 app.include_router(service_router)
 app.include_router(classify_router)
+app.include_router(hcaptcha_router)
 
 
 @app.get("/health")
@@ -46,13 +48,13 @@ async def health():
     return {"status": "ok"}
 
 
-# ── Pre-load CLIP at startup so the first request is not slow ─────────────────
+# ── Pre-load MobileCLIP at startup so first request is fast ───────────────
 @app.on_event("startup")
 async def preload_model():
-    logger.info("Pre-loading CLIP model …")
+    logger.info("Pre-loading MobileCLIP model …")
     from app.models.clip_solver import _load_model
     _load_model()
-    logger.info("CLIP model ready ✓")
+    logger.info("MobileCLIP ready ✓ — server is ready for requests")
 
 
 # ── CLI entry ─────────────────────────────────────────────────────────────────

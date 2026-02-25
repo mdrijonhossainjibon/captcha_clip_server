@@ -8,8 +8,12 @@ numpy>=1.26.0,<2.0.0
 torch==2.2.2
 torchvision==0.17.2
 
-transformers==4.40.0
+# Fast CLIP for CPU
 open-clip-torch==2.24.0
+transformers>=4.40.0
 python-multipart==0.0.9
 pymongo==4.6.2
 PyJWT==2.8.0
+
+# CPU speed optimization
+onnxruntime>=1.17.0

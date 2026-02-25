@@ -48,13 +48,14 @@ async def health():
     return {"status": "ok"}
 
 
-# ── Pre-load MobileCLIP at startup so first request is fast ───────────────
+# ── Pre-load CLIP at startup so first request is fast ──────────────────────────
 @app.on_event("startup")
 async def preload_model():
-    logger.info("Pre-loading MobileCLIP model …")
+    from app import config
+    logger.info(f"Pre-loading CLIP model ({config.CLIP_MODEL}) …")
     from app.models.clip_solver import _load_model
     _load_model()
-    logger.info("MobileCLIP ready ✓ — server is ready for requests")
+    logger.info(f"CLIP model ready ({config.CLIP_MODEL}) — server is ready for requests")
 
 
 # ── CLI entry ─────────────────────────────────────────────────────────────────

@@ -23,6 +23,8 @@ from PIL import Image
 
 logger = logging.getLogger(__name__)
 
+from app.config import CLIP_MODEL, CLIP_PRETRAINED
+
 # CPU Speed Tuning
 _cpu_count = os.cpu_count() or 4
 try:
@@ -31,24 +33,25 @@ except RuntimeError:
     pass
 
 # Model Config
-# Apple's MobileCLIP is very fast on CPU
-_MODEL_NAME = "MobileCLIP-S2"
-_PRETRAINED = "datacompdr"
+_MODEL_NAME = CLIP_MODEL
+_PRETRAINED = CLIP_PRETRAINED
 
 _model = None
 _preprocess = None
 _tokenizer = None
-_device = "cpu"
+_device = "cuda" if torch.cuda.is_available() else "cpu"
+
+logger.info(f"Using device: {_device}")
 
 def _load_model():
     global _model, _preprocess, _tokenizer
     if _model is not None:
         return
-    logger.info(f"Loading {_MODEL_NAME} for CPU speed ...")
+    logger.info(f"Loading {_MODEL_NAME} with {_PRETRAINED} ...")
     _model, _, _preprocess = open_clip.create_model_and_transforms(_MODEL_NAME, pretrained=_PRETRAINED)
     _model = _model.to(_device).eval()
     _tokenizer = open_clip.get_tokenizer(_MODEL_NAME)
-    logger.info("MobileCLIP ready ✓")
+    logger.info(f"CLIP model {_MODEL_NAME} ready ✓")
 
 def _decode_image(b64: str) -> Image.Image:
     b64 = re.sub(r"^data:image/[^;]+;base64,", "", b64)

@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
  
-CLIP_MODEL: str = os.getenv("CLIP_MODEL", "ViT-B/16")
+CLIP_MODEL: str = os.getenv("CLIP_MODEL", "ViT-B-16")
 CLIP_PRETRAINED: str = os.getenv("CLIP_PRETRAINED", "openai")
 GRID_THRESHOLD: float = float(os.getenv("GRID_THRESHOLD", "0.55"))
 MONGODB_URI: str = os.getenv("MONGODB_URI", "mongodb://admin:Roman6432@206.189.157.8:27017/AdminHub?authSource=admin")

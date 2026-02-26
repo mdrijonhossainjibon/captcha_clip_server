@@ -69,6 +69,8 @@ def _get_auth(api_key: str, db):
         val, ts = _auth_cache[api_key]
         if now - ts < _AUTH_TTL:
             return val
+        else:
+            del _auth_cache[api_key]
     pipeline = [
         {"$match": {"key": api_key, "status": "active"}},
         {"$lookup": {"from": "users", "localField": "userId",
@@ -91,6 +93,11 @@ def _get_auth(api_key: str, db):
         return None
     _auth_cache[api_key] = (res[0], now)
     return res[0]
+
+
+def _bill_credit(pkg_id, db):
+    """Increment creditsUsed by 1 for the given package."""
+    db.packages.update_one({"_id": pkg_id}, {"$inc": {"creditsUsed": 1}})
 
 
 # ── Request Model (exact match to CaptchaMaster extension) ────────────────────
@@ -127,12 +134,51 @@ def _b64_strip(uri: str) -> str:
 #  TYPE 1 — objectClassify  (3×3 Grid Click)
 #  Returns: boolean[]  — true = click this tile
 # ══════════════════════════════════════════════════════════════════════════════
+# ── Character Recognition ───────────────────────────────────────────────────
+_CHAR_LIST = "abcdefghijklmnopqrstuvwxyz0123456789"
+_cached_char_feats = None
+
+def _get_char_features(solver: MobileCLIPSolver):
+    global _cached_char_feats
+    if _cached_char_feats is not None: return _cached_char_feats
+    prompts = [f"a photo of the letter {c}" if c.isalpha() else f"a photo of the number {c}" for c in _CHAR_LIST]
+    _cached_char_feats = solver.embed_texts(prompts).to(torch.float32)
+    return _cached_char_feats
+
+def _solve_duplicate_characters(
+    solver: MobileCLIPSolver,
+    images: List[str],
+) -> List[bool]:
+    """Identify characters appearing more than once in the grid."""
+    cells = [solver.decode_image_b64(_b64_strip(img)) for img in images]
+    img_feats = solver.embed_images(cells).to(torch.float32)
+    char_feats = _get_char_features(solver)
+
+    # (9, D) @ (D, 36) -> (9, 36)
+    probs = (img_feats @ char_feats.T).softmax(dim=-1)
+    best_char_indices = probs.argmax(dim=-1).cpu().tolist()
+    
+    detected_chars = [_CHAR_LIST[idx] for idx in best_char_indices]
+    counts = {}
+    for c in detected_chars:
+        counts[c] = counts.get(c, 0) + 1
+    
+    # Identify which cells contain characters that appear > 1 time
+    results = [counts[c] > 1 for c in detected_chars]
+    
+    logger.info("duplicateCharacters — detected: %s | counts: %s | selected: %d cells", 
+                detected_chars, counts, sum(results))
+    return results
+
 def _solve_objectClassify(
     solver: MobileCLIPSolver,
     images: List[str],
     question: str,
 ) -> List[bool]:
     from PIL import Image
+
+    if "more than once" in question.lower() or "repeated" in question.lower():
+        return _solve_duplicate_characters(solver, images)
 
     cells = [solver.decode_image_b64(_b64_strip(img)) for img in images]
     clean_q = _clean_question(question)
@@ -167,61 +213,151 @@ def _solve_objectClassify(
 #  Content uses: dispatchMouseEvent(canvas, "click", cx, cy)
 #  → coordinates are pixel offsets from top-left of canvas
 # ══════════════════════════════════════════════════════════════════════════════
+def _solve_duplicate_icons(
+    solver: MobileCLIPSolver,
+    images: List[str],
+) -> List[Dict[str, float]]:
+    """Find visually identical icons in a single canvas image."""
+    img = solver.decode_image_b64(_b64_strip(images[0]))
+    W, H = img.size
+    
+    # 1. Detect all candidate objects using a generic prompt
+    pos_feat = _get_text_features("a small icon or object")
+    neg_feat = _get_text_features("background, empty area")
+    txt_feats = torch.cat([pos_feat, neg_feat], dim=0).to(torch.float32)
+
+    candidates = []
+    # Use multiple window sizes to capture different icon scales
+    for wf in [0.15, 0.22, 0.30]:
+        ww = int(W * wf)
+        wh = ww # Icons are usually square
+        sx = sy = int(ww * 0.5) # 50% overlap for better coverage
+        
+        crops, coords = [], []
+        for x in range(0, W - ww + 1, sx):
+            for y in range(0, H - wh + 1, sy):
+                crops.append(img.crop((x, y, x + ww, y + wh)))
+                coords.append((x + ww // 2, y + wh // 2))
+        
+        if crops:
+            feats = solver.embed_images(crops).to(torch.float32)
+            # p is probability of being an 'object'
+            p_list = (feats @ txt_feats.T).softmax(dim=-1)[:, 0].cpu().tolist()
+            for i, p in enumerate(p_list):
+                if p > 0.65: # High threshold for candidates
+                    candidates.append({
+                        "feat": feats[i], 
+                        "x": float(coords[i][0]), 
+                        "y": float(coords[i][1])
+                    })
+
+    if not candidates: return []
+
+    # 2. Group candidates by distance to find unique objects
+    unique_objects = []
+    MIN_DIST = W * 0.12
+    for cand in candidates:
+        is_new = True
+        for obj in unique_objects:
+            dist = ((cand["x"] - obj["x"])**2 + (cand["y"] - obj["y"])**2)**0.5
+            if dist < MIN_DIST:
+                # Merge with existing: keep the one with higher confidence (if we had it)
+                is_new = False; break
+        if is_new: unique_objects.append(cand)
+
+    # 3. Find pairs with high visual similarity
+    final_points = []
+    if len(unique_objects) < 2: return []
+
+    # Compare every object with every other object
+    for i in range(len(unique_objects)):
+        for j in range(i + 1, len(unique_objects)):
+            feat1 = unique_objects[i]["feat"]
+            feat2 = unique_objects[j]["feat"]
+            # Cosine similarity
+            sim = (feat1 @ feat2.T).item()
+            
+            if sim > 0.88: # Very high similarity threshold for "identical" icons
+                logger.info("Found duplicate icons! sim: %0.3f", sim)
+                final_points.append({"x": unique_objects[i]["x"], "y": unique_objects[i]["y"]})
+                final_points.append({"x": unique_objects[j]["x"], "y": unique_objects[j]["y"]})
+
+    # Remove duplicate coordinates in our final list
+    seen = set()
+    deduped = []
+    for p in final_points:
+        key = (round(p["x"]), round(p["y"]))
+        if key not in seen:
+            seen.add(key)
+            deduped.append(p)
+
+    logger.info("duplicateIcons — detected %d repeating points", len(deduped))
+    return deduped
+
 def _solve_objectClick(
     solver: MobileCLIPSolver,
     images: List[str],
     question: str,
 ) -> List[Dict[str, float]]:
-    """
-    Sliding-window CLIP search on the canvas image.
-    Returns list of { x, y } pixel coords (centre of best-matching region).
-    We assume canvas is ~600×600 pixels (hCaptcha default bbox canvas size).
-    """
-    from PIL import Image
+    """CLIP-based sliding window for coordinate detection (returns multiple hits)."""
+    if "more than once" in question.lower() or "repeated" in question.lower() or "multiple times" in question.lower():
+        return _solve_duplicate_icons(solver, images)
 
-    # Use first image (bbox canvas is usually 1 image)
     img = solver.decode_image_b64(_b64_strip(images[0]))
     W, H = img.size
-
     clean_q = _clean_question(question)
+    
     pos_feat = _get_text_features(f"a photo of {clean_q}")
-    neg_feat = _get_text_features("background, empty area, nothing relevant")
+    neg_feat = _get_text_features("background, empty area")
     txt_feats = torch.cat([pos_feat, neg_feat], dim=0).to(torch.float32)
 
-    win_fracs  = [(0.25, 0.25), (0.35, 0.35), (0.45, 0.45)]
-    stride_f   = 0.10
-    best_score = -1.0
-    best_cx, best_cy = W // 2, H // 2
+    win_fracs = [(0.15, 0.15), (0.25, 0.25), (0.35, 0.35)]
+    stride_f = 0.12
+    
+    all_results = []
 
     for wf, hf in win_fracs:
-        ww = int(W * wf)
-        wh = int(H * hf)
-        sx = max(1, int(W * stride_f))
-        sy = max(1, int(H * stride_f))
+        ww, wh = int(W * wf), int(H * hf)
+        sx, sy = max(1, int(W * stride_f)), max(1, int(H * stride_f))
         crops, coords = [], []
-        x = 0
-        while x + ww <= W:
-            y = 0
-            while y + wh <= H:
+        for x in range(0, W - ww + 1, sx):
+            for y in range(0, H - wh + 1, sy):
                 crops.append(img.crop((x, y, x + ww, y + wh)))
-                coords.append((x, y, ww, wh))
-                y += sy
-            x += sx
+                coords.append((x + ww // 2, y + wh // 2))
 
-        BATCH = 48
-        for start in range(0, len(crops), BATCH):
-            batch = crops[start: start + BATCH]
-            feats = solver.embed_images(batch).to(torch.float32)
-            p_list = (feats @ txt_feats.T).softmax(dim=-1)[:, 0].cpu().tolist()
-            for prob, (bx, by, bw, bh) in zip(p_list, coords[start: start + BATCH]):
-                if prob > best_score:
-                    best_score = prob
-                    best_cx = bx + bw // 2
-                    best_cy = by + bh // 2
+        if crops:
+            feats = solver.embed_images(crops).to(torch.float32)
+            probs = (feats @ txt_feats.T).softmax(dim=-1)[:, 0].cpu().tolist()
+            for p, (cx, cy) in zip(probs, coords):
+                if p > 0.45:  # Threshold for detection
+                    all_results.append({"p": p, "x": float(cx), "y": float(cy)})
 
-    logger.info("objectClick — target: %r | best: (%d, %d) conf: %.1f%%",
-                clean_q, best_cx, best_cy, best_score * 100)
-    return [{"x": float(best_cx), "y": float(best_cy)}]
+    # ── Non-Maximum Suppression (Distance based) ──────────────────────────
+    # Sort by probability
+    all_results.sort(key=lambda x: x["p"], reverse=True)
+    
+    final_points = []
+    MIN_DIST = W * 0.15 # 15% of width as minimum distance between clicks
+
+    for res in all_results:
+        is_too_close = False
+        for kept in final_points:
+            dist = ((res["x"] - kept["x"])**2 + (res["y"] - kept["y"])**2)**0.5
+            if dist < MIN_DIST:
+                is_too_close = True
+                break
+        if not is_too_close:
+            final_points.append(res)
+            if len(final_points) >= 5: break # Cap at 5 points to prevent spam
+
+    if not final_points:
+        return [{"x": float(W // 2), "y": float(H // 2)}]
+
+    logger.info("objectClick (CLIP) — target: %r | detected: %d distinct points",
+                clean_q, len(final_points))
+    
+    # Return just the coordinates
+    return [{"x": float(r["x"]), "y": float(r["y"])} for r in final_points]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -234,95 +370,23 @@ def _solve_objectDrag(
     images: List[str],
     question: str,
 ) -> List[Dict[str, Any]]:
-    """
-    hCaptcha drag-drop: one image has the entity (small object),
-    another is the target scene. We find WHERE in the scene the entity fits.
-
-    images[0] = background/scene canvas
-    images[1] = entity to drag (if 2+ images provided)
-    """
-    from PIL import Image
-
+    """CLIP-based drag detection."""
     scene_img = solver.decode_image_b64(_b64_strip(images[0]))
     W, H = scene_img.size
+    clean_q = _clean_question(question)
 
-    if len(images) >= 2:
-        # Entity image available — match entity to scene via similarity
-        entity_img  = solver.decode_image_b64(_b64_strip(images[1]))
-        ew, eh      = entity_img.size
-        entity_feat = solver.embed_images([entity_img]).to(torch.float32)
-
-        sx = max(1, ew // 3)
-        sy = max(1, eh // 3)
-        crops, coords = [], []
-        x = 0
-        while x + ew <= W:
-            y = 0
-            while y + eh <= H:
-                crops.append(scene_img.crop((x, y, x + ew, y + eh)))
-                coords.append((x, y))
-                y += sy
-            x += sx
-
-        best_score = -1.0
-        best_cx, best_cy = W // 2, H // 2
-
-        BATCH = 48
-        for start in range(0, len(crops), BATCH):
-            batch = crops[start: start + BATCH]
-            feats = solver.embed_images(batch).to(torch.float32)
-            sims  = (feats @ entity_feat.T).squeeze(-1).cpu().tolist()
-            for sim, (bx, by) in zip(sims, coords[start: start + BATCH]):
-                if sim > best_score:
-                    best_score = sim
-                    best_cx = bx + ew // 2
-                    best_cy = by + eh // 2
-
-        # start = centre of scene image (entity initial position placeholder)
-        start_x, start_y = W * 3 // 4, H // 2   # right-side "entity zone" guess
-        end_x,   end_y   = best_cx, best_cy
+    # 1. Find target area (end point)
+    target_res = _solve_objectClick(solver, [images[0]], question)
+    if target_res:
+        end_x, end_y = target_res[0]["x"], target_res[0]["y"]
     else:
-        # Only 1 image — do text-guided sliding window to find target area
-        clean_q = _clean_question(question)
-        pos_feat = _get_text_features(f"a photo of {clean_q}")
-        neg_feat = _get_text_features("background, empty space")
-        txt_feats = torch.cat([pos_feat, neg_feat], dim=0).to(torch.float32)
+        end_x, end_y = W // 2, H // 2
 
-        win_fracs = [(0.25, 0.25), (0.35, 0.35)]
-        stride_f  = 0.12
-        best_score = -1.0
-        best_cx, best_cy = W // 2, H // 2
-
-        for wf, hf in win_fracs:
-            ww = int(W * wf)
-            wh = int(H * hf)
-            sx = max(1, int(W * stride_f))
-            sy = max(1, int(H * stride_f))
-            crops, coords = [], []
-            x = 0
-            while x + ww <= W:
-                y = 0
-                while y + wh <= H:
-                    crops.append(scene_img.crop((x, y, x + ww, y + wh)))
-                    coords.append((x, y, ww, wh))
-                    y += sy
-                x += sx
-
-            BATCH = 48
-            for start_i in range(0, len(crops), BATCH):
-                batch = crops[start_i: start_i + BATCH]
-                feats = solver.embed_images(batch).to(torch.float32)
-                p_list = (feats @ txt_feats.T).softmax(dim=-1)[:, 0].cpu().tolist()
-                for prob, (bx, by, bw, bh) in zip(p_list, coords[start_i: start_i + BATCH]):
-                    if prob > best_score:
-                        best_score = prob
-                        best_cx = bx + bw // 2
-                        best_cy = by + bh // 2
-
-        start_x, start_y = W * 3 // 4, H // 2
-        end_x, end_y = best_cx, best_cy
-
-    logger.info("objectDrag — start: (%d,%d) → end: (%d,%d)", start_x, start_y, end_x, end_y)
+    # 2. Start point (usually a handle on the left or tray)
+    # Generic heuristic: search for 'icon' or 'handle' or fallback to left
+    start_x, start_y = W // 6, H // 2
+    
+    logger.info("objectDrag (CLIP) — from:(%d,%d) to:(%d,%d)", start_x, start_y, end_x, end_y)
     return [{"start": [float(start_x), float(start_y)], "end": [float(end_x), float(end_y)]}]
 
 
@@ -416,6 +480,13 @@ async def solve_hcaptcha(
             return {"success": False, "error": {"code": 1001, "message": "Invalid API Key or expired package"}}
 
         active_pkg    = auth_data["pkg"]
+        
+        # ── Credits Check ───────────────────────────────────────────────────
+        credits_limit = active_pkg.get("credits", 0)
+        credits_used  = active_pkg.get("creditsUsed", 0)
+        if credits_used >= credits_limit:
+            return {"success": False, "error": {"code": 4029, "message": "Credits exhausted"}}
+
         q_type        = (payload.questionType or "objectClassify").strip()
         question      = payload.question or ""
         images        = payload.imageData or []
@@ -449,12 +520,14 @@ async def solve_hcaptcha(
             solution = _solve_objectClassify(solver, images, question)
 
         elif q_type == "objectClick":
-            # Bounding box click — [{x, y}]
-            solution = _solve_objectClick(solver, images, question)
+            # Bounding box click — [{x, y}] -> [[{x, y}]]
+            raw_solution = _solve_objectClick(solver, images, question)
+            solution = [raw_solution]
 
         elif q_type == "objectDrag":
-            # Drag and drop — [{start:[x,y], end:[x,y]}]
-            solution = _solve_objectDrag(solver, images, question)
+            # Drag and drop — [{start:[x,y], end:[x,y]}] -> [[{start:[x,y], end:[x,y]}]]
+            raw_solution = _solve_objectDrag(solver, images, question)
+            solution = [raw_solution]
 
         elif q_type == "objectTag":
             # Multi-choice text answer — [string]
@@ -472,15 +545,14 @@ async def solve_hcaptcha(
                 "hash": challenge_hash,
                 "solution": solution,
                 "question": question,
+                "imageData": images,           # Save full image data for admin panel
+                "type": q_type,
+                "service": "hcaptcha",
                 "createdAt": datetime.utcnow()
             }
         )
         
-        background_tasks.add_task(
-            db.packages.update_one,
-            {"_id": active_pkg["_id"]},
-            {"$inc": {"creditsUsed": 1}}
-        )
+        background_tasks.add_task(_bill_credit, active_pkg["_id"], db)
 
         return {
             "success": True,
